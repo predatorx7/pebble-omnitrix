@@ -24,6 +24,7 @@
 typedef enum {
   NODE_IDLE = 0,
   NODE_DNA_SCAN,
+  NODE_SELECT_ENTER,
   NODE_TRANSFORM_SELECT,
   NODE_ACTIVATING,
   NODE_TRANSFORMED,
@@ -56,6 +57,9 @@ typedef enum {
 #define FLASH_FRAMES           6    // default strobe flash length
 #define GREEN_FLASH_FRAMES     5    // idle -> select solid flash
 #define SPLASH_FRAMES          3    // red "locked" splash
+#define SELECT_ENTER_SPARK_FRAMES 2               // idle->select: emblem sparks green in place
+#define SELECT_ENTER_MOVE_FRAMES  SECS_TO_FRAMES(1)  // then triangles slide fully across center
+#define SELECT_ENTER_FRAMES    (SELECT_ENTER_SPARK_FRAMES + SELECT_ENTER_MOVE_FRAMES)
 
 // ---------------------------------------------------------------------------
 // State
@@ -277,6 +281,43 @@ static void build_dna_scan(BuildContext c) {
   EnergyFrame(c, GColorCyan, 2, 2);
 }
 
+// Idle -> select transition: the same two triangles that make up the idle
+// emblem spark green in place, then the left one slides fully to the right
+// and the right one fully to the left -- each stops once every pixel of it
+// has crossed the centerline, leaving them swapped as <| |> at the edges.
+static void build_select_enter(BuildContext c) {
+  GRect b = c.rect;
+  GPoint ctr = GPoint(b.size.w / 2, b.size.h / 2);
+
+  int f = (int)s_node_frame;
+  if (f > SELECT_ENTER_FRAMES) f = SELECT_ENTER_FRAMES;
+
+  Fill(c, GColorBlack);
+
+  bool sparking = f < SELECT_ENTER_SPARK_FRAMES;
+  GColor color = sparking ? ((f % 2) ? GColorGreen : GColorWhite) : GColorGreen;
+
+  int mf = f - SELECT_ENTER_SPARK_FRAMES;
+  if (mf < 0) mf = 0;
+  int dx = (ctr.x * mf) / SELECT_ENTER_MOVE_FRAMES;
+
+  graphics_context_set_fill_color(c.ctx, flip(color));
+
+  // Left triangle: base on the left edge, tip at center -- slides right by dx.
+  GPathInfo left_info = { .num_points = 3, .points = (GPoint[]) {
+    GPoint(dx, 0), GPoint(dx, b.size.h), GPoint(ctr.x + dx, ctr.y) } };
+  GPath *left = gpath_create(&left_info);
+  gpath_draw_filled(c.ctx, left);
+  gpath_destroy(left);
+
+  // Right triangle: base on the right edge, tip at center -- slides left by dx.
+  GPathInfo right_info = { .num_points = 3, .points = (GPoint[]) {
+    GPoint(b.size.w - dx, 0), GPoint(b.size.w - dx, b.size.h), GPoint(ctr.x - dx, ctr.y) } };
+  GPath *right = gpath_create(&right_info);
+  gpath_draw_filled(c.ctx, right);
+  gpath_destroy(right);
+}
+
 // The one screen that does NOT use the badge template: the green diamond.
 static void build_select(BuildContext c) {
   GRect b = c.rect;
@@ -371,6 +412,7 @@ typedef struct {
 static const Node NODES[NODE_COUNT] = {
   [NODE_IDLE]             = { "idle",         build_idle,           0,                   NODE_STAY,          act_omniboost,  false, false },
   [NODE_DNA_SCAN]         = { "dna_scan",     build_dna_scan,       0,                   NODE_STAY,          act_omniboost,  false, false },
+  [NODE_SELECT_ENTER]     = { "select_enter", build_select_enter,   SELECT_ENTER_FRAMES, NODE_TRANSFORM_SELECT, NULL,        false, true  },
   [NODE_TRANSFORM_SELECT] = { "select",       build_select,         0,                   NODE_STAY,          act_pick_alien, false, false },
   [NODE_ACTIVATING]       = { "activating",   build_activating,     ACT_TOTAL_FRAMES,    NODE_TRANSFORMED,   NULL,           false, true  },
   [NODE_TRANSFORMED]      = { "transformed",  build_transformed,    TRANSFORM_FRAMES,    NODE_RECALIBRATION, act_omniboost,  false, false },
@@ -393,7 +435,7 @@ typedef struct {
 } Nav;
 
 static const Nav NAV[] = {
-  { NODE_IDLE,             NODE_TRANSFORM_SELECT, BUTTON_ID_SELECT, true,  true,  GREEN_FLASH_FRAMES, GColorGreenARGB8 },
+  { NODE_IDLE,             NODE_SELECT_ENTER,     BUTTON_ID_SELECT, false, false, 0,                  0 },
   { NODE_DNA_SCAN,         NODE_TRANSFORM_SELECT, BUTTON_ID_SELECT, false, false, 0,                  0 },
   { NODE_TRANSFORM_SELECT, NODE_ACTIVATING,       BUTTON_ID_SELECT, true,  true,  GREEN_FLASH_FRAMES, GColorGreenARGB8 },
   { NODE_TRANSFORM_SELECT, NODE_IDLE,             BUTTON_ID_BACK,   false, false, 0,                  0 },
