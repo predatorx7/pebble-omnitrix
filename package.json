@@ -1,0 +1,36 @@
+{
+    "author": "whiteshadow",
+    "dependencies": {},
+    "keywords": [
+        "omnitrix",
+        "omniverse",
+        "app",
+        "game",
+        "pebble-app"
+    ],
+    "name": "omnitrix",
+    "pebble": {
+        "displayName": "Omnitrix",
+        "enableMultiJS": true,
+        "messageKeys": [],
+        "projectType": "native",
+        "resources": {
+            "media": []
+        },
+        "sdkVersion": "3",
+        "targetPlatforms": [
+            "aplite",
+            "basalt",
+            "chalk",
+            "diorite",
+            "emery",
+            "flint",
+            "gabbro"
+        ],
+        "uuid": "1a8b57ce-9509-486a-a724-9b102a48e449",
+        "watchapp": {
+            "watchface": false
+        }
+    },
+    "version": "0.1.0"
+}
