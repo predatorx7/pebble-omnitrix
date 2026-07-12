@@ -1,740 +1,548 @@
 #include <pebble.h>
 
 // ---------------------------------------------------------------------------
-// Omnitrix Game — full-screen badge state machine (game, not a watchface)
+// Omnitrix Game — declarative node router
 //
-// The Omnitrix face fills the whole screen. A black "hourglass" emblem sits on
-// a colored energy disc. Everything is driven by GAME LOGIC and the buttons —
-// there is no dependency on real battery / charging / wall clock.
+// The game is described as DATA wherever possible:
 //
-//   * When inactive the badge is WHITE. Pressing SELECT opens alien-select
-//     mode (browse with UP/DOWN); pressing SELECT again transforms and starts
-//     a silent 1-minute timer. It holds steady green while charged, then flashes
-//     between green and red as it nears timeout. On discharge it holds red for
-//     30 s, then flashes green, turns green, and after 2 s returns to the white
-//     idle badge.
-//     Pressing SELECT while transformed powers down through a brief red-spark
-//     -> green surge -> white idle sequence instead of cutting straight back.
+//   * NODES[]  — one row per screen. A node declares how it renders, an
+//                optional timed auto-advance (auto_frames -> auto_to), an
+//                optional in-node action (on_click), and flags (locked /
+//                transient). Timed "journeys" are therefore data, not code.
+//   * NAV[]    — declarative navigation edges: "from a node, this button leads
+//                to that node", optionally played through a colour flash.
 //
-//   * Buttons:
-//       - SELECT(short) : advance flow  Idle -> Alien Select -> Transformed -> Idle
-//       - SELECT(long)  : enter / exit DNA Scan mode
-//       - UP    (short) : previous alien (in select); else toggle Omniboost
-//       - DOWN  (short) : next alien (in select)
-//       - UP    (long)  : toggle Hijacked badge state
-//       - DOWN  (long)  : toggle Master Control badge state
+// The router composes cross-cutting behaviour on top of the tables: global
+// long-press toggles, a red-splash "locked" node, transient nodes that ignore
+// input, a per-node frame counter, and a vibration pulse on every transition.
+//
+// Rendering is built by COMPOSITION: small primitives (badge_ring, hourglass,
+// frame, shapes) combine into a badge() combinator that each node's renderer
+// composes with overlays.
 // ---------------------------------------------------------------------------
 
-// Manual states the user drives with the buttons.
 typedef enum {
-  MSTATE_IDLE = 0,          // Normal / Omniboost badge (colour from charge)
-  MSTATE_DNA_SCAN,          // Scanning for a DNA sample
-  MSTATE_TRANSFORM_SELECT,  // Selecting an alien
-  MSTATE_ACTIVATING,        // Lock-in flash: diamond -> green transformed
-  MSTATE_TRANSFORMED,       // Transformation locked in, countdown running
-  MSTATE_DEACTIVATING,      // Manual power-down: red spark -> green -> idle
-  MSTATE_RECALIBRATION,     // Discharge recovery: flash -> red -> flash -> green -> idle
-  MSTATE_MASTER_CONTROL,    // Master Control unlocked
-  MSTATE_HIJACKED,          // Badge hijacked
-  MSTATE_ALIEN_SCAN,        // Yellow field with a fast glitchy scan line
-  MSTATE_PURPLE,            // Purple-only field
-  MSTATE_FLASH,             // Full-screen colour flash transitioning to a target
-} GameState;
+  NODE_IDLE = 0,
+  NODE_DNA_SCAN,
+  NODE_TRANSFORM_SELECT,
+  NODE_ACTIVATING,
+  NODE_TRANSFORMED,
+  NODE_DEACTIVATING,
+  NODE_RECALIBRATION,
+  NODE_MASTER_CONTROL,
+  NODE_HIJACKED,
+  NODE_ALIEN_SCAN,
+  NODE_PURPLE,
+  NODE_FLASH,
+  NODE_COUNT,
+} NodeId;
+
+#define NODE_STAY (-1)
 
 #define NUM_ALIENS 10
 #define ANIM_INTERVAL_MS 120
-#define TRANSFORM_SECS 60      // transformation lasts 1 minute
-#define ACT_TOTAL_FRAMES 8     // lock-in flash length (~1s)
-// Discharge recovery timeline (seconds since discharge):
-//   hold red -> flash green -> hold green (2s) -> idle.
-#define DISCHARGE_RED_SECS 30
-#define GREEN_FLASH_SECS 1
-#define RECHARGE_GREEN_SECS 2
-#define RECAL_FLASH_END (DISCHARGE_RED_SECS + GREEN_FLASH_SECS)
-#define RECAL_TOTAL_SECS (RECAL_FLASH_END + RECHARGE_GREEN_SECS)
-#define DEACT_RED_FRAMES 5     // red-spark phase of manual power-down (~0.6s)
-#define DEACT_TOTAL_FRAMES 10  // red then green, then back to white idle
-#define FLASH_FRAMES 6         // full-screen intro flash length (~0.7s)
-#define SPLASH_FRAMES 3        // brief red "locked" splash (~0.4s)
+#define SECS_TO_FRAMES(s) ((s) * 1000 / ANIM_INTERVAL_MS)
 
+// Timed journeys, declared in frames (derived from seconds).
+#define TRANSFORM_FRAMES       SECS_TO_FRAMES(60)   // transformation lasts 1 min
+#define DISCHARGE_RED_FRAMES   SECS_TO_FRAMES(30)   // hold red after discharge
+#define RECAL_FLASH_FRAMES     SECS_TO_FRAMES(1)    // flash green
+#define RECHARGE_GREEN_FRAMES  SECS_TO_FRAMES(2)    // hold green
+#define RECAL_TOTAL_FRAMES     (DISCHARGE_RED_FRAMES + RECAL_FLASH_FRAMES + RECHARGE_GREEN_FRAMES)
+#define TIMEOUT_WARN_FRAMES    SECS_TO_FRAMES(4)  // green/red flash before timeout
+#define ACT_TOTAL_FRAMES       8    // lock-in flash (~1s)
+#define DEACT_RED_FRAMES       5    // red-spark phase of power-down
+#define DEACT_TOTAL_FRAMES     10   // red -> green -> idle
+#define FLASH_FRAMES           6    // default strobe flash length
+#define GREEN_FLASH_FRAMES     5    // idle -> select solid flash
+#define SPLASH_FRAMES          3    // red "locked" splash
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
 static Window *s_main_window;
 static Layer *s_omnitrix_layer;
-static TextLayer *s_time_layer;
-static TextLayer *s_date_layer;
 static AppTimer *s_anim_timer;
 
-static GameState s_state = MSTATE_IDLE;
+static int s_node = NODE_IDLE;
+static uint32_t s_node_frame = 0;      // frames since entering the current node
+static uint32_t s_anim_tick = 0;       // free-running (for continuous effects)
 static bool s_omniboost = false;
 static int s_selected_alien = 0;
-static uint32_t s_anim_tick = 0;
-static int s_charge_pct = 100;         // game energy when idle / ready
-static time_t s_transform_deadline = 0;
-static time_t s_discharge_time = 0;    // when the transformation discharged
-static int s_deact_frame = 0;          // manual power-down animation frame
-static int s_act_frame = 0;            // lock-in (activation) animation frame
-static GameState s_prev_state = MSTATE_IDLE; // for detecting transitions (vibe)
-static int s_splash_frame = 0;         // brief red "locked" splash counter
-static int s_flash_frame = 0;          // full-screen intro flash frame
-static int s_flash_len = 0;            // flash duration in frames
-static bool s_flash_solid = false;     // true = one solid flash, false = strobe
-static GColor s_flash_color;           // colour of the intro flash
-static GameState s_flash_target;       // state to enter when the flash ends
+static int s_splash_frame = 0;
 
-// Begin a full-screen colour flash that settles into `target`. When `solid` is
-// true it holds one steady flash for `frames`; otherwise it strobes.
-static void start_flash(GColor color, GameState target, bool solid, int frames) {
-  s_flash_color = color;
-  s_flash_target = target;
-  s_flash_solid = solid;
-  s_flash_len = frames;
-  s_flash_frame = 0;
-  s_state = MSTATE_FLASH;
-}
+// Flash transition parameters.
+static bool s_flash_solid = false;
+static int s_flash_len = 0;
+static int s_flash_target = NODE_IDLE;
+static GColor s_flash_color;
+
+static void refresh();
 
 // ---------------------------------------------------------------------------
-// Charge / colour model
+// Colour / charge model
 // ---------------------------------------------------------------------------
-
-// Effective charge: during a transformation this is the countdown remaining as
-// a percentage; otherwise it's the stored game energy.
 static int charge_pct() {
-  if (s_state == MSTATE_TRANSFORMED) {
-    int remaining = (int)(s_transform_deadline - time(NULL));
-    if (remaining < 0) remaining = 0;
-    return (remaining * 100) / TRANSFORM_SECS;
+  if (s_node == NODE_TRANSFORMED) {
+    int rem = TRANSFORM_FRAMES - (int)s_node_frame;
+    if (rem < 0) rem = 0;
+    return rem * 100 / TRANSFORM_FRAMES;
   }
-  return s_charge_pct;
+  return 100;
 }
 
-// Battery-style colour band, now driven by the game charge.
-//   >60% green, >20% orange, else red  (reference 100-60 / 60-20 / 20-0 rows).
 static GColor band_color() {
   int pct = charge_pct();
-  if (pct > 60) {
-    return GColorGreen;
-  } else if (pct > 20) {
-    return GColorOrange;
-  }
+  if (pct > 60) return GColorGreen;
+  if (pct > 20) return GColorOrange;
   return GColorRed;
 }
 
-// Resolve auto-transitions (countdown expiry, recovery end) then return the
-// state we actually draw.
-static GameState resolve_state() {
-  time_t now = time(NULL);
-
-  if (s_state == MSTATE_TRANSFORMED) {
-    if (now >= s_transform_deadline) {
-      // Discharged: begin the red -> green flash -> green -> idle recovery.
-      s_state = MSTATE_RECALIBRATION;
-      s_discharge_time = now;
-    }
-  } else if (s_state == MSTATE_RECALIBRATION) {
-    if (now - s_discharge_time >= RECAL_TOTAL_SECS) {
-      s_state = MSTATE_IDLE;
-      s_charge_pct = 100;
-    }
-  }
-  return s_state;
-}
-
-// The 4 sub-variants shown in the reference cycle over time.
 static int variant_index(uint32_t period) {
   return (int)((s_anim_tick / period) % 4);
 }
 
 // ---------------------------------------------------------------------------
-// Emblem drawing helpers
+// Drawing primitives
 // ---------------------------------------------------------------------------
+static GColor flip(GColor c) { return c; }  // global colour hook (passthrough)
 
-// Colour passthrough (no-op). The colour-flip experiment was reverted; kept as
-// a single hook in case a global colour transform is wanted later.
-static GColor flip(GColor c) {
-  return c;
-}
-
-// Full-screen energy field. A thin border ring is drawn on the left/right
-// edges only (the layout is rotated 90 degrees), so the field runs edge-to-
-// edge vertically.
-static void draw_badge_ring(GContext *ctx, GRect bounds, GColor fill, GColor ring) {
+static void draw_badge_ring(GContext *ctx, GRect b, GColor fill, GColor ring) {
   graphics_context_set_fill_color(ctx, flip(ring));
-  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+  graphics_fill_rect(ctx, b, 0, GCornerNone);
   graphics_context_set_fill_color(ctx, flip(fill));
-  graphics_fill_rect(ctx, GRect(4, 0, bounds.size.w - 8, bounds.size.h), 0, GCornerNone);
+  graphics_fill_rect(ctx, GRect(4, 0, b.size.w - 8, b.size.h), 0, GCornerNone);
 }
 
-// Draw the Omnitrix "hourglass" rotated 90 degrees: two triangles whose apexes
-// meet at the centre, bases pinned to the top/bottom screen edges.
-static void draw_hourglass(GContext *ctx, GRect bounds, GColor color, int inset) {
-  GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
-  int left   = inset;
-  int right  = bounds.size.w - inset;
-  int top    = 0;                       // bases run to the top/bottom edges
-  int bottom = bounds.size.h;
-  // The waist gives the join a real width so the two halves meet across a
-  // solid band instead of pinching to a single point (which looks like a gap).
+static void draw_hourglass(GContext *ctx, GRect b, GColor color, int inset) {
+  GPoint center = GPoint(b.size.w / 2, b.size.h / 2);
+  int left = inset, right = b.size.w - inset, top = 0, bottom = b.size.h;
   int waist = (right - left) / 8;
-  // Overlap the two halves across the centre so there is no seam line.
-  int ty = center.y + 3;
-  int by = center.y - 3;
-
+  int ty = center.y + 3, by = center.y - 3;
   graphics_context_set_fill_color(ctx, flip(color));
-
-  GPathInfo top_info = {
-    .num_points = 4,
-    .points = (GPoint[]) {
-      GPoint(left, top), GPoint(right, top),
-      GPoint(center.x + waist, ty), GPoint(center.x - waist, ty)
-    }
-  };
-  GPath *tt = gpath_create(&top_info);
-  gpath_draw_filled(ctx, tt);
-  gpath_destroy(tt);
-
-  GPathInfo bottom_info = {
-    .num_points = 4,
-    .points = (GPoint[]) {
-      GPoint(left, bottom), GPoint(right, bottom),
-      GPoint(center.x + waist, by), GPoint(center.x - waist, by)
-    }
-  };
-  GPath *bt = gpath_create(&bottom_info);
-  gpath_draw_filled(ctx, bt);
-  gpath_destroy(bt);
+  GPathInfo t = { .num_points = 4, .points = (GPoint[]) {
+    GPoint(left, top), GPoint(right, top),
+    GPoint(center.x + waist, ty), GPoint(center.x - waist, ty) } };
+  GPath *tp = gpath_create(&t); gpath_draw_filled(ctx, tp); gpath_destroy(tp);
+  GPathInfo m = { .num_points = 4, .points = (GPoint[]) {
+    GPoint(left, bottom), GPoint(right, bottom),
+    GPoint(center.x + waist, by), GPoint(center.x - waist, by) } };
+  GPath *mp = gpath_create(&m); gpath_draw_filled(ctx, mp); gpath_destroy(mp);
 }
 
-// Draw an inset energy frame (used for glow / boost / warning borders).
-static void draw_frame(GContext *ctx, GRect bounds, GColor color, int inset, int width) {
+static void draw_frame(GContext *ctx, GRect b, GColor color, int inset, int width) {
   graphics_context_set_stroke_color(ctx, flip(color));
   graphics_context_set_stroke_width(ctx, width);
-  GRect r = GRect(inset, inset,
-                  bounds.size.w - 2 * inset,
-                  bounds.size.h - 2 * inset);
-  graphics_draw_rect(ctx, r);
+  graphics_draw_rect(ctx, GRect(inset, inset, b.size.w - 2 * inset, b.size.h - 2 * inset));
 }
 
-// Simple triangle-wave pulse in [0,1] scaled to [0,max].
 static int pulse(int max, uint32_t period) {
-  uint32_t p = s_anim_tick % period;
-  uint32_t half = period / 2;
+  uint32_t p = s_anim_tick % period, half = period / 2;
   uint32_t up = (p < half) ? p : (period - p);
   return (int)((up * max) / half);
 }
 
-// Filled diamond (rotated square) centred at c with half-extent r.
 static void draw_diamond(GContext *ctx, GPoint c, int r, GColor color) {
   graphics_context_set_fill_color(ctx, flip(color));
-  GPathInfo info = {
-    .num_points = 4,
-    .points = (GPoint[]) {
-      GPoint(c.x, c.y - r), GPoint(c.x + r, c.y),
-      GPoint(c.x, c.y + r), GPoint(c.x - r, c.y)
-    }
-  };
-  GPath *p = gpath_create(&info);
-  gpath_draw_filled(ctx, p);
-  gpath_destroy(p);
+  GPathInfo info = { .num_points = 4, .points = (GPoint[]) {
+    GPoint(c.x, c.y - r), GPoint(c.x + r, c.y),
+    GPoint(c.x, c.y + r), GPoint(c.x - r, c.y) } };
+  GPath *p = gpath_create(&info); gpath_draw_filled(ctx, p); gpath_destroy(p);
 }
 
-// Draw a filled regular polygon (n sides) centred at c, radius r, top vertex up.
 static void draw_polygon(GContext *ctx, GPoint c, int r, int sides, GColor color) {
   GPoint pts[8];
   for (int i = 0; i < sides; i++) {
-    int32_t angle = TRIG_MAX_ANGLE * i / sides - (TRIG_MAX_ANGLE / 4);
-    pts[i] = GPoint(c.x + (int)(cos_lookup(angle) * r / TRIG_MAX_RATIO),
-                    c.y + (int)(sin_lookup(angle) * r / TRIG_MAX_RATIO));
+    int32_t a = TRIG_MAX_ANGLE * i / sides - (TRIG_MAX_ANGLE / 4);
+    pts[i] = GPoint(c.x + (int)(cos_lookup(a) * r / TRIG_MAX_RATIO),
+                    c.y + (int)(sin_lookup(a) * r / TRIG_MAX_RATIO));
   }
   GPathInfo info = { .num_points = (uint32_t)sides, .points = pts };
   GPath *p = gpath_create(&info);
   graphics_context_set_fill_color(ctx, flip(color));
-  gpath_draw_filled(ctx, p);
-  gpath_destroy(p);
+  gpath_draw_filled(ctx, p); gpath_destroy(p);
 }
 
-// Draw a filled 5-point star centred at c, outer radius r.
 static void draw_star(GContext *ctx, GPoint c, int r, GColor color) {
   GPoint pts[10];
   for (int i = 0; i < 10; i++) {
     int rad = (i % 2 == 0) ? r : r / 2;
-    int32_t angle = TRIG_MAX_ANGLE * i / 10 - (TRIG_MAX_ANGLE / 4);
-    pts[i] = GPoint(c.x + (int)(cos_lookup(angle) * rad / TRIG_MAX_RATIO),
-                    c.y + (int)(sin_lookup(angle) * rad / TRIG_MAX_RATIO));
+    int32_t a = TRIG_MAX_ANGLE * i / 10 - (TRIG_MAX_ANGLE / 4);
+    pts[i] = GPoint(c.x + (int)(cos_lookup(a) * rad / TRIG_MAX_RATIO),
+                    c.y + (int)(sin_lookup(a) * rad / TRIG_MAX_RATIO));
   }
   GPathInfo info = { .num_points = 10, .points = pts };
   GPath *p = gpath_create(&info);
   graphics_context_set_fill_color(ctx, flip(color));
-  gpath_draw_filled(ctx, p);
-  gpath_destroy(p);
+  gpath_draw_filled(ctx, p); gpath_destroy(p);
 }
 
-// Draw the glyph for alien `index` (0..NUM_ALIENS-1) centred at c, size r.
 static void draw_alien_shape(GContext *ctx, GPoint c, int r, int index, GColor color) {
   graphics_context_set_fill_color(ctx, flip(color));
   graphics_context_set_stroke_color(ctx, flip(color));
   switch (index) {
-    case 0:  graphics_fill_circle(ctx, c, r); break;                 // circle
-    case 1:  draw_polygon(ctx, c, r, 3, color); break;               // triangle
-    case 2:  graphics_fill_rect(ctx, GRect(c.x - r, c.y - r, 2 * r, 2 * r),
-                                0, GCornerNone); break;              // square
-    case 3:  draw_star(ctx, c, r, color); break;                     // star
-    case 4:  draw_diamond(ctx, c, r, color); break;                  // diamond
-    case 5:  draw_polygon(ctx, c, r, 5, color); break;               // pentagon
-    case 6:  draw_polygon(ctx, c, r, 6, color); break;               // hexagon
-    case 7:  // plus / cross
+    case 0:  graphics_fill_circle(ctx, c, r); break;
+    case 1:  draw_polygon(ctx, c, r, 3, color); break;
+    case 2:  graphics_fill_rect(ctx, GRect(c.x - r, c.y - r, 2 * r, 2 * r), 0, GCornerNone); break;
+    case 3:  draw_star(ctx, c, r, color); break;
+    case 4:  draw_diamond(ctx, c, r, color); break;
+    case 5:  draw_polygon(ctx, c, r, 5, color); break;
+    case 6:  draw_polygon(ctx, c, r, 6, color); break;
+    case 7:
       graphics_fill_rect(ctx, GRect(c.x - r / 3, c.y - r, 2 * r / 3, 2 * r), 0, GCornerNone);
       graphics_fill_rect(ctx, GRect(c.x - r, c.y - r / 3, 2 * r, 2 * r / 3), 0, GCornerNone);
       break;
-    case 8:  // ring (hollow circle)
-      graphics_context_set_stroke_width(ctx, 4);
-      graphics_draw_circle(ctx, c, r);
-      break;
-    default: // X
-      graphics_context_set_stroke_width(ctx, 4);
-      graphics_draw_line(ctx, GPoint(c.x - r, c.y - r), GPoint(c.x + r, c.y + r));
-      graphics_draw_line(ctx, GPoint(c.x - r, c.y + r), GPoint(c.x + r, c.y - r));
-      break;
+    case 8:  graphics_context_set_stroke_width(ctx, 4); graphics_draw_circle(ctx, c, r); break;
+    default: graphics_context_set_stroke_width(ctx, 4);
+             graphics_draw_line(ctx, GPoint(c.x - r, c.y - r), GPoint(c.x + r, c.y + r));
+             graphics_draw_line(ctx, GPoint(c.x - r, c.y + r), GPoint(c.x + r, c.y - r));
+             break;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Per-state rendering
+// Widget layer (Flutter-like): a BuildContext carries the canvas + bounds, and
+// small composable widgets paint into it. Every node's build() composes these.
 // ---------------------------------------------------------------------------
-static void omnitrix_update_proc(Layer *layer, GContext *ctx) {
-  GRect bounds = layer_get_bounds(layer);
-  GameState state = resolve_state();
-  GColor band = band_color();
+typedef struct { GContext *ctx; GRect rect; } BuildContext;
 
-  // Base fill (full screen).
-  graphics_context_set_fill_color(ctx, flip(GColorBlack));
-  graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+// Leaf widgets.
+static void Fill(BuildContext c, GColor color) {
+  graphics_context_set_fill_color(c.ctx, flip(color));
+  graphics_fill_rect(c.ctx, c.rect, 0, GCornerNone);
+}
+static void Emblem(BuildContext c, GColor color) { draw_hourglass(c.ctx, c.rect, color, 6); }
+static void EnergyFrame(BuildContext c, GColor color, int inset, int width) {
+  draw_frame(c.ctx, c.rect, color, inset, width);
+}
+static void ScanBarV(BuildContext c, GColor color, int x, int w) {
+  graphics_context_set_fill_color(c.ctx, flip(color));
+  graphics_fill_rect(c.ctx, GRect(x, 0, w, c.rect.size.h), 0, GCornerNone);
+}
 
-  // A button press during the red timed-out state just splashes red briefly.
-  if (s_splash_frame > 0) {
-    graphics_context_set_fill_color(ctx, GColorRed);
-    graphics_fill_rect(ctx, bounds, 0, GCornerNone);
+// The reusable IDLE-STYLE TEMPLATE, shared by every screen except select:
+// a full field with a left/right border ring and the hourglass emblem.
+typedef struct {
+  GColor fill, ring, emblem;
+} Badge;
+
+static void BadgeScreen(BuildContext c, Badge b) {
+  draw_badge_ring(c.ctx, c.rect, b.fill, b.ring);
+  Emblem(c, b.emblem);
+}
+
+// Composite widget: the animated glitch scan overlay (alien scan screen).
+static void GlitchScan(BuildContext c) {
+  GRect b = c.rect;
+  int base_y = (int)((s_anim_tick * 8) % b.size.h);
+  for (int x = 0; x < b.size.w; x += 10) {
+    uint32_t h = (uint32_t)(x * 2654435761u + s_anim_tick * 40503u);
+    if ((h & 7) == 0) continue;
+    int jitter = (int)((h >> 3) % 7) - 3;
+    int segw = 5 + (int)((h >> 6) % 6);
+    graphics_context_set_fill_color(c.ctx, flip(((h >> 9) & 3) == 0 ? GColorCyan : GColorWhite));
+    graphics_fill_rect(c.ctx, GRect(x, base_y + jitter, segw, 3), 0, GCornerNone);
+  }
+  for (int i = 0; i < 2; i++) {
+    uint32_t g = (uint32_t)((i + 1) * 2246822519u + s_anim_tick * 3266489917u);
+    graphics_context_set_fill_color(c.ctx, flip(GColorWhite));
+    graphics_fill_rect(c.ctx, GRect((int)((g >> 8) % b.size.w), (int)(g % b.size.h),
+                                    8 + (int)((g >> 4) % 20), 2), 0, GCornerNone);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Node build() methods — each composes the shared BadgeScreen template plus
+// overlays (except build_select, the intentional exception).
+// ---------------------------------------------------------------------------
+static void build_idle(BuildContext c) {
+  BadgeScreen(c, (Badge){ s_omniboost ? GColorGreen : GColorWhite, GColorBlack, GColorBlack });
+  if (s_omniboost) EnergyFrame(c, GColorMintGreen, 3 + pulse(3, 16), 4);
+}
+
+static void build_dna_scan(BuildContext c) {
+  BadgeScreen(c, (Badge){ band_color(), GColorBlack, GColorBlack });
+  GRect b = c.rect;
+  graphics_context_set_fill_color(c.ctx, GColorCyan);
+  graphics_context_set_stroke_color(c.ctx, GColorCyan);
+  GPoint center = GPoint(b.size.w / 2, b.size.h / 2);
+  switch (variant_index(6)) {
+    case 0: ScanBarV(c, GColorCyan, (s_anim_tick * 4) % b.size.w, 4); break;
+    case 1: graphics_context_set_stroke_width(c.ctx, 3); graphics_draw_circle(c.ctx, center, pulse(b.size.w / 2, 16)); break;
+    case 2: graphics_context_set_stroke_width(c.ctx, 2);
+            graphics_draw_line(c.ctx, GPoint(0, center.y), GPoint(b.size.w, center.y));
+            graphics_draw_line(c.ctx, GPoint(center.x, 0), GPoint(center.x, b.size.h)); break;
+    default: graphics_fill_rect(c.ctx, GRect((int)(s_anim_tick % b.size.w), center.y - 3, 8, 6), 0, GCornerNone); break;
+  }
+  EnergyFrame(c, GColorCyan, 2, 2);
+}
+
+// The one screen that does NOT use the badge template: the green diamond.
+static void build_select(BuildContext c) {
+  GRect b = c.rect;
+  GPoint ctr = GPoint(b.size.w / 2, b.size.h / 2);
+  int dr = (b.size.w < b.size.h ? b.size.w : b.size.h) / 2 - 6;
+  Fill(c, GColorBlack);
+  draw_diamond(c.ctx, ctr, dr, GColorGreen);
+  draw_alien_shape(c.ctx, ctr, dr / 3, s_selected_alien, GColorBlack);
+}
+
+static void build_activating(BuildContext c) {
+  if (s_node_frame % 2 == 0) build_select(c);
+  else BadgeScreen(c, (Badge){ GColorGreen, GColorBlack, GColorBlack });
+}
+
+static void build_transformed(BuildContext c) {
+  int rem = TRANSFORM_FRAMES - (int)s_node_frame;   // steady green, flash near timeout
+  GColor field = (rem > TIMEOUT_WARN_FRAMES) ? GColorGreen
+               : ((s_anim_tick % 2) ? GColorGreen : GColorRed);
+  BadgeScreen(c, (Badge){ field, GColorBlack, GColorBlack });
+}
+
+static void build_deactivating(BuildContext c) {
+  bool red_phase = (int)s_node_frame < DEACT_RED_FRAMES;
+  BadgeScreen(c, (Badge){ red_phase ? GColorRed : GColorGreen, GColorBlack, GColorBlack });
+  if (red_phase) EnergyFrame(c, (s_anim_tick % 2) ? GColorWhite : GColorRed, 3, 4);
+  else EnergyFrame(c, GColorMintGreen, 3, 3);
+}
+
+static void build_recalibration(BuildContext c) {
+  int f = (int)s_node_frame;
+  GColor field = (f < DISCHARGE_RED_FRAMES)      ? GColorRed
+               : (f < DISCHARGE_RED_FRAMES + RECAL_FLASH_FRAMES)
+                   ? ((s_anim_tick % 2) ? GColorGreen : GColorBlack)   // flash green
+                   : GColorGreen;
+  BadgeScreen(c, (Badge){ field, GColorBlack, GColorBlack });
+}
+
+static void build_master_control(BuildContext c) {
+  BadgeScreen(c, (Badge){ GColorBlack, GColorGreen, GColorGreen });
+  int p = pulse(3, 20);
+  EnergyFrame(c, GColorMintGreen, 4 + p, 4);
+  EnergyFrame(c, GColorGreen, 10 + p, 2);
+}
+
+static void build_hijacked(BuildContext c) {
+  bool flicker = (s_anim_tick % 6) < 4;
+  BadgeScreen(c, (Badge){ GColorBlack, GColorRed, flicker ? GColorRed : GColorDarkCandyAppleRed });
+  EnergyFrame(c, GColorRed, 3, 4);
+}
+
+static void build_alien_scan(BuildContext c) {
+  BadgeScreen(c, (Badge){ GColorYellow, GColorBlack, GColorBlack });
+  GlitchScan(c);
+}
+
+static void build_purple(BuildContext c) {
+  BadgeScreen(c, (Badge){ GColorPurple, GColorBlack, GColorBlack });
+}
+
+static void build_flash(BuildContext c) {
+  bool on = s_flash_solid || ((s_node_frame % 2) == 0);
+  Fill(c, on ? s_flash_color : GColorBlack);
+}
+
+// ---------------------------------------------------------------------------
+// In-node actions (short press). Return NODE_STAY (no navigation).
+// ---------------------------------------------------------------------------
+static int act_omniboost(uint8_t button) {
+  if (button == BUTTON_ID_UP) s_omniboost = !s_omniboost;
+  return NODE_STAY;
+}
+static int act_pick_alien(uint8_t button) {
+  if (button == BUTTON_ID_UP)   s_selected_alien = (s_selected_alien + NUM_ALIENS - 1) % NUM_ALIENS;
+  if (button == BUTTON_ID_DOWN) s_selected_alien = (s_selected_alien + 1) % NUM_ALIENS;
+  return NODE_STAY;
+}
+
+// ---------------------------------------------------------------------------
+// Node table (declarative)
+// ---------------------------------------------------------------------------
+typedef struct {
+  const char *name;
+  void (*build)(BuildContext);
+  uint16_t auto_frames;   // 0 = none; else advance to auto_to after N frames
+  int8_t   auto_to;
+  int (*on_click)(uint8_t button);
+  bool locked;            // input only splashes red
+  bool transient;         // ignore all input
+} Node;
+
+static const Node NODES[NODE_COUNT] = {
+  [NODE_IDLE]             = { "idle",         build_idle,           0,                   NODE_STAY,          act_omniboost,  false, false },
+  [NODE_DNA_SCAN]         = { "dna_scan",     build_dna_scan,       0,                   NODE_STAY,          act_omniboost,  false, false },
+  [NODE_TRANSFORM_SELECT] = { "select",       build_select,         0,                   NODE_STAY,          act_pick_alien, false, false },
+  [NODE_ACTIVATING]       = { "activating",   build_activating,     ACT_TOTAL_FRAMES,    NODE_TRANSFORMED,   NULL,           false, true  },
+  [NODE_TRANSFORMED]      = { "transformed",  build_transformed,    TRANSFORM_FRAMES,    NODE_RECALIBRATION, act_omniboost,  false, false },
+  [NODE_DEACTIVATING]     = { "deactivating", build_deactivating,   DEACT_TOTAL_FRAMES,  NODE_IDLE,          NULL,           false, true  },
+  [NODE_RECALIBRATION]    = { "recal",        build_recalibration,  RECAL_TOTAL_FRAMES,  NODE_IDLE,          NULL,           true,  false },
+  [NODE_MASTER_CONTROL]   = { "master",       build_master_control, 0,                   NODE_STAY,          act_omniboost,  false, false },
+  [NODE_HIJACKED]         = { "hijacked",     build_hijacked,       0,                   NODE_STAY,          act_omniboost,  false, false },
+  [NODE_ALIEN_SCAN]       = { "alien_scan",   build_alien_scan,     0,                   NODE_STAY,          act_omniboost,  false, false },
+  [NODE_PURPLE]           = { "purple",       build_purple,         0,                   NODE_STAY,          act_omniboost,  false, false },
+  [NODE_FLASH]            = { "flash",        build_flash,          0,                   NODE_STAY,          NULL,           false, true  },
+};
+
+// Declarative navigation edges (Yarn-style): from + short button -> to,
+// optionally played through a colour flash.
+typedef struct {
+  int8_t from, to;
+  uint8_t button;
+  bool flash, flash_solid;
+  uint8_t flash_len, flash_argb;
+} Nav;
+
+static const Nav NAV[] = {
+  { NODE_IDLE,             NODE_TRANSFORM_SELECT, BUTTON_ID_SELECT, true,  true,  GREEN_FLASH_FRAMES, GColorGreenARGB8 },
+  { NODE_DNA_SCAN,         NODE_TRANSFORM_SELECT, BUTTON_ID_SELECT, false, false, 0,                  0 },
+  { NODE_TRANSFORM_SELECT, NODE_ACTIVATING,       BUTTON_ID_SELECT, true,  true,  GREEN_FLASH_FRAMES, GColorGreenARGB8 },
+  { NODE_TRANSFORM_SELECT, NODE_IDLE,             BUTTON_ID_BACK,   false, false, 0,                  0 },
+  { NODE_TRANSFORMED,      NODE_DEACTIVATING,     BUTTON_ID_SELECT, false, false, 0,                  0 },
+  { NODE_MASTER_CONTROL,   NODE_IDLE,             BUTTON_ID_SELECT, false, false, 0,                  0 },
+  { NODE_HIJACKED,         NODE_IDLE,             BUTTON_ID_SELECT, false, false, 0,                  0 },
+  { NODE_ALIEN_SCAN,       NODE_IDLE,             BUTTON_ID_SELECT, false, false, 0,                  0 },
+  { NODE_PURPLE,           NODE_IDLE,             BUTTON_ID_SELECT, false, false, 0,                  0 },
+  { NODE_IDLE,             NODE_ALIEN_SCAN,       BUTTON_ID_DOWN,   true,  false, FLASH_FRAMES,       GColorYellowARGB8 },
+  { NODE_ALIEN_SCAN,       NODE_PURPLE,           BUTTON_ID_DOWN,   true,  false, FLASH_FRAMES,       GColorPurpleARGB8 },
+  { NODE_PURPLE,           NODE_IDLE,             BUTTON_ID_DOWN,   false, false, 0,                  0 },
+};
+#define NAV_COUNT (sizeof(NAV) / sizeof(NAV[0]))
+
+// ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+static void router_goto(int id) {
+  s_node = id;
+  s_node_frame = 0;
+  vibes_short_pulse();               // buzz on every transition/flash
+  refresh();
+}
+
+static void start_flash(uint8_t argb, int target, bool solid, int len) {
+  s_flash_color = (GColor){ .argb = argb };
+  s_flash_target = target;
+  s_flash_solid = solid;
+  s_flash_len = len;
+  router_goto(NODE_FLASH);
+}
+
+static void router_click(uint8_t button, bool long_press) {
+  const Node *n = &NODES[s_node];
+
+  if (n->locked) {                   // discharged: input only splashes red
+    s_splash_frame = SPLASH_FRAMES;
+    vibes_short_pulse();
+    refresh();
+    return;
+  }
+  if (n->transient) return;
+
+  if (long_press) {                  // global long-press toggles
+    int to = NODE_STAY;
+    if (button == BUTTON_ID_UP)          to = (s_node == NODE_HIJACKED)       ? NODE_IDLE : NODE_HIJACKED;
+    else if (button == BUTTON_ID_DOWN)   to = (s_node == NODE_MASTER_CONTROL) ? NODE_IDLE : NODE_MASTER_CONTROL;
+    else if (button == BUTTON_ID_SELECT) to = (s_node == NODE_DNA_SCAN)       ? NODE_IDLE : NODE_DNA_SCAN;
+    if (to != NODE_STAY) router_goto(to);
     return;
   }
 
-  switch (state) {
-    case MSTATE_IDLE: {
-      // Inactive: white energy field with black hourglass emblem.
-      // Omniboost tints it bright green with a pulsing glow.
-      GColor idle_fill = s_omniboost ? GColorGreen : GColorWhite;
-      draw_badge_ring(ctx, bounds, idle_fill, GColorBlack);
-      draw_hourglass(ctx, bounds, GColorBlack, 6);
-      if (s_omniboost) {
-        int p = pulse(3, 16);
-        draw_frame(ctx, bounds, GColorMintGreen, 3 + p, 4);
-      }
-      break;
+  for (unsigned i = 0; i < NAV_COUNT; i++) {   // declarative navigation
+    if (NAV[i].from == s_node && NAV[i].button == button) {
+      if (NAV[i].flash) start_flash(NAV[i].flash_argb, NAV[i].to, NAV[i].flash_solid, NAV[i].flash_len);
+      else router_goto(NAV[i].to);
+      return;
     }
-
-    case MSTATE_DNA_SCAN: {
-      // Disc + emblem with one of 4 cycling cyan scan effects.
-      draw_badge_ring(ctx, bounds, band, GColorBlack);
-      draw_hourglass(ctx, bounds, GColorBlack, 6);
-      graphics_context_set_fill_color(ctx, GColorCyan);
-      graphics_context_set_stroke_color(ctx, GColorCyan);
-      GPoint center = GPoint(bounds.size.w / 2, bounds.size.h / 2);
-
-      switch (variant_index(6)) {
-        case 0: {   // scan bar sweep (rotated: vertical bar, left -> right)
-          int scan_x = (s_anim_tick * 4) % bounds.size.w;
-          graphics_fill_rect(ctx, GRect(scan_x, 0, 4, bounds.size.h), 0, GCornerNone);
-          break;
-        }
-        case 1: {   // expanding cyan ring
-          int r = pulse(bounds.size.w / 2, 16);
-          graphics_context_set_stroke_width(ctx, 3);
-          graphics_draw_circle(ctx, center, r);
-          break;
-        }
-        case 2: {   // crosshair / reticle
-          graphics_context_set_stroke_width(ctx, 2);
-          graphics_draw_line(ctx, GPoint(0, center.y), GPoint(bounds.size.w, center.y));
-          graphics_draw_line(ctx, GPoint(center.x, 0), GPoint(center.x, bounds.size.h));
-          break;
-        }
-        default: {  // spinner tick
-          int a = (int)(s_anim_tick % bounds.size.w);
-          graphics_fill_rect(ctx, GRect(a, center.y - 3, 8, 6), 0, GCornerNone);
-          break;
-        }
-      }
-      draw_frame(ctx, bounds, GColorCyan, 2, 2);
-      break;
-    }
-
-    case MSTATE_TRANSFORM_SELECT: {
-      // Green diamond badge; the selected alien is shown as a distinct black
-      // glyph in the middle (circle, triangle, square, star, ... up to 10).
-      GPoint c = GPoint(bounds.size.w / 2, bounds.size.h / 2);
-      int dr = (bounds.size.w < bounds.size.h ? bounds.size.w : bounds.size.h) / 2 - 6;
-      graphics_context_set_fill_color(ctx, flip(GColorBlack));
-      graphics_fill_rect(ctx, bounds, 0, GCornerNone);
-      draw_diamond(ctx, c, dr, GColorGreen);
-      draw_alien_shape(ctx, c, dr / 3, s_selected_alien, GColorBlack);
-      break;
-    }
-
-    case MSTATE_ACTIVATING: {
-      // Lock-in flash: alternate the green diamond glyph with the green
-      // transformed badge, settling into the transformation.
-      if (s_act_frame % 2 == 0) {
-        GPoint c = GPoint(bounds.size.w / 2, bounds.size.h / 2);
-        int dr = (bounds.size.w < bounds.size.h ? bounds.size.w : bounds.size.h) / 2 - 6;
-        graphics_context_set_fill_color(ctx, flip(GColorBlack));
-        graphics_fill_rect(ctx, bounds, 0, GCornerNone);
-        draw_diamond(ctx, c, dr, GColorGreen);
-        draw_alien_shape(ctx, c, dr / 3, s_selected_alien, GColorBlack);
-      } else {
-        draw_badge_ring(ctx, bounds, GColorGreen, GColorBlack);
-        draw_hourglass(ctx, bounds, GColorBlack, 6);
-      }
-      break;
-    }
-
-    case MSTATE_TRANSFORMED: {
-      // Steady green while charged; once it drops out of the green band (close
-      // to timeout) it flashes between green and red until discharge. At
-      // discharge, RECALIBRATION flashes then settles to solid red.
-      GColor field = (charge_pct() > 60)
-          ? GColorGreen
-          : ((s_anim_tick % 2) ? GColorGreen : GColorRed);
-      draw_badge_ring(ctx, bounds, field, GColorBlack);
-      draw_hourglass(ctx, bounds, GColorBlack, 6);
-      break;
-    }
-
-    case MSTATE_DEACTIVATING: {
-      // Manual power-down: a red spark burst, then a green surge, then idle.
-      bool red_phase = s_deact_frame < DEACT_RED_FRAMES;
-      GColor field = red_phase ? GColorRed : GColorGreen;
-      draw_badge_ring(ctx, bounds, field, GColorBlack);
-      draw_hourglass(ctx, bounds, GColorBlack, 6);
-      if (red_phase) {
-        // Electric red spark flicker.
-        bool spark = (s_anim_tick % 2) == 0;
-        draw_frame(ctx, bounds, spark ? GColorWhite : GColorRed, 3, 4);
-      } else {
-        draw_frame(ctx, bounds, GColorMintGreen, 3, 3);
-      }
-      break;
-    }
-
-    case MSTATE_RECALIBRATION: {
-      // Discharge recovery timeline:
-      //   hold red (30s) -> flash green (1s) -> hold green (2s) ->
-      //   resolve_state() returns the badge to white idle.
-      int elapsed = (int)(time(NULL) - s_discharge_time);
-      GColor field;
-      if (elapsed < DISCHARGE_RED_SECS) {
-        field = GColorRed;                                     // discharged: red
-      } else if (elapsed < RECAL_FLASH_END) {
-        field = (s_anim_tick % 2) ? GColorGreen : GColorBlack; // flash green
-      } else {
-        field = GColorGreen;                                   // recharged: green (2s)
-      }
-      draw_badge_ring(ctx, bounds, field, GColorBlack);
-      draw_hourglass(ctx, bounds, GColorBlack, 6);
-      break;
-    }
-
-    case MSTATE_HIJACKED: {
-      // Black field, flickering red emblem + red warning frame.
-      bool flicker = (s_anim_tick % 6) < 4;
-      draw_badge_ring(ctx, bounds, GColorBlack, GColorRed);
-      draw_hourglass(ctx, bounds, flicker ? GColorRed : GColorDarkCandyAppleRed, 6);
-      draw_frame(ctx, bounds, GColorRed, 3, 4);
-      break;
-    }
-
-    case MSTATE_MASTER_CONTROL: {
-      // Black field, green emblem, steady bright green master frames.
-      draw_badge_ring(ctx, bounds, GColorBlack, GColorGreen);
-      draw_hourglass(ctx, bounds, GColorGreen, 6);
-      int p = pulse(3, 20);
-      draw_frame(ctx, bounds, GColorMintGreen, 4 + p, 4);
-      draw_frame(ctx, bounds, GColorGreen, 10 + p, 2);
-      break;
-    }
-
-    case MSTATE_ALIEN_SCAN: {
-      // Yellow alien-scanning field + black hourglass with a fast, glitchy
-      // scan line sweeping top -> bottom.
-      draw_badge_ring(ctx, bounds, GColorYellow, GColorBlack);
-      draw_hourglass(ctx, bounds, GColorBlack, 6);
-
-      int base_y = (int)((s_anim_tick * 8) % bounds.size.h);
-      // Broken/jittered main line: short white segments at varying y offsets.
-      for (int x = 0; x < bounds.size.w; x += 10) {
-        uint32_t h = (uint32_t)(x * 2654435761u + s_anim_tick * 40503u);
-        if ((h & 7) == 0) continue;                 // occasional gap
-        int jitter = (int)((h >> 3) % 7) - 3;        // -3..3 px
-        int segw = 5 + (int)((h >> 6) % 6);          // 5..10 px
-        GColor c = ((h >> 9) & 3) == 0 ? GColorCyan : GColorWhite;
-        graphics_context_set_fill_color(ctx, flip(c));
-        graphics_fill_rect(ctx, GRect(x, base_y + jitter, segw, 3), 0, GCornerNone);
-      }
-      // Stray glitch tear lines elsewhere on the field.
-      for (int i = 0; i < 2; i++) {
-        uint32_t g = (uint32_t)((i + 1) * 2246822519u + s_anim_tick * 3266489917u);
-        int gy = (int)(g % bounds.size.h);
-        int gx = (int)((g >> 8) % bounds.size.w);
-        graphics_context_set_fill_color(ctx, flip(GColorWhite));
-        graphics_fill_rect(ctx, GRect(gx, gy, 8 + (int)((g >> 4) % 20), 2), 0, GCornerNone);
-      }
-      break;
-    }
-
-    case MSTATE_PURPLE: {
-      // Purple-only field with black hourglass (no scan line).
-      draw_badge_ring(ctx, bounds, GColorPurple, GColorBlack);
-      draw_hourglass(ctx, bounds, GColorBlack, 6);
-      break;
-    }
-
-    case MSTATE_FLASH: {
-      // Full-screen colour flash before the target: one solid fill, or a
-      // strobe alternating with black.
-      bool on = s_flash_solid || ((s_flash_frame % 2) == 0);
-      graphics_context_set_fill_color(ctx, flip(on ? s_flash_color : GColorBlack));
-      graphics_fill_rect(ctx, bounds, 0, GCornerNone);
-      break;
-    }
+  }
+  if (button == BUTTON_ID_BACK) {    // no BACK edge -> default: exit the app
+    window_stack_pop(true);
+    return;
+  }
+  if (n->on_click) {                 // in-node action
+    int t = n->on_click(button);
+    if (t != NODE_STAY) router_goto(t); else refresh();
   }
 }
 
-// ---------------------------------------------------------------------------
-// Text overlay — game status (not a clock)
-// ---------------------------------------------------------------------------
-static void update_status() {
-  // Every state is now conveyed purely through the badge graphics — no text.
-  layer_set_hidden(text_layer_get_layer(s_time_layer), true);
-  layer_set_hidden(text_layer_get_layer(s_date_layer), true);
-}
-
-static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
-  resolve_state();
-  update_status();
-  if (s_omnitrix_layer) {
-    layer_mark_dirty(s_omnitrix_layer);
-  }
+static void router_tick(void) {
+  if (s_splash_frame > 0) s_splash_frame--;
+  s_node_frame++;
+  const Node *n = &NODES[s_node];
+  int limit  = (s_node == NODE_FLASH) ? s_flash_len    : n->auto_frames;
+  int target = (s_node == NODE_FLASH) ? s_flash_target : n->auto_to;
+  if (limit > 0 && (int)s_node_frame >= limit) router_goto(target);
 }
 
 // ---------------------------------------------------------------------------
-// Animation driver
+// Rendering entry point
 // ---------------------------------------------------------------------------
-// Buzz once whenever the rendered state changes (covers every transition and
-// flash, including the timed auto-transitions).
-static void buzz_on_transition() {
-  if (s_state != s_prev_state) {
-    vibes_short_pulse();
-    s_prev_state = s_state;
+static void omnitrix_update_proc(Layer *layer, GContext *ctx) {
+  BuildContext c = { ctx, layer_get_bounds(layer) };
+  Fill(c, GColorBlack);
+  if (s_splash_frame > 0) {          // locked red splash overrides everything
+    Fill(c, GColorRed);
+    return;
   }
+  if (NODES[s_node].build) NODES[s_node].build(c);
+}
+
+// ---------------------------------------------------------------------------
+// Timers / input
+// ---------------------------------------------------------------------------
+static void refresh() {
+  if (s_omnitrix_layer) layer_mark_dirty(s_omnitrix_layer);
 }
 
 static void anim_timer_callback(void *data) {
   s_anim_tick++;
-  if (s_splash_frame > 0) {
-    s_splash_frame--;
-  }
-  if (s_state == MSTATE_FLASH) {
-    s_flash_frame++;
-    if (s_flash_frame >= s_flash_len) {
-      s_state = s_flash_target;
-    }
-  } else if (s_state == MSTATE_ACTIVATING) {
-    s_act_frame++;
-    if (s_act_frame >= ACT_TOTAL_FRAMES) {
-      s_state = MSTATE_TRANSFORMED;
-      s_transform_deadline = time(NULL) + TRANSFORM_SECS;
-    }
-  } else if (s_state == MSTATE_DEACTIVATING) {
-    s_deact_frame++;
-    if (s_deact_frame >= DEACT_TOTAL_FRAMES) {
-      s_state = MSTATE_IDLE;
-      s_charge_pct = 100;
-      update_status();
-    }
-  }
-  buzz_on_transition();
-  if (s_omnitrix_layer) {
-    layer_mark_dirty(s_omnitrix_layer);
-  }
+  router_tick();
+  if (s_omnitrix_layer) layer_mark_dirty(s_omnitrix_layer);
   s_anim_timer = app_timer_register(ANIM_INTERVAL_MS, anim_timer_callback, NULL);
 }
 
-// ---------------------------------------------------------------------------
-// Button handlers
-// ---------------------------------------------------------------------------
-static void refresh() {
-  update_status();
-  if (s_omnitrix_layer) {
-    layer_mark_dirty(s_omnitrix_layer);
-  }
-}
-
-// While in the red timed-out state the badge is locked: any button just
-// splashes red briefly and stays put until it recharges. Returns true if the
-// press was consumed.
-static bool locked_in_recal() {
-  if (s_state == MSTATE_RECALIBRATION) {
-    s_splash_frame = SPLASH_FRAMES;
-    vibes_short_pulse();
-    refresh();
-    return true;
-  }
-  return false;
-}
-
-// UP short: previous alien while selecting; otherwise toggle Omniboost.
-static void up_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (locked_in_recal()) return;
-  if (s_state == MSTATE_TRANSFORM_SELECT) {
-    s_selected_alien = (s_selected_alien + NUM_ALIENS - 1) % NUM_ALIENS;
-  } else {
-    s_omniboost = !s_omniboost;
-  }
-  refresh();
-}
-
-// UP long: toggle Hijacked badge state.
-static void up_long_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (locked_in_recal()) return;
-  s_state = (s_state == MSTATE_HIJACKED) ? MSTATE_IDLE : MSTATE_HIJACKED;
-  refresh();
-}
-
-// SELECT short: advance the activation flow.
-//   Idle / Scan -> Alien Select -> Transformed (10 min) -> Idle.
-static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (locked_in_recal()) return;
-  switch (s_state) {
-    case MSTATE_IDLE:             start_flash(GColorGreen, MSTATE_TRANSFORM_SELECT, true, 5); break;
-    case MSTATE_DNA_SCAN:         s_state = MSTATE_TRANSFORM_SELECT; break;
-    case MSTATE_TRANSFORM_SELECT:
-      // Play the lock-in flash first; the timer starts when it settles.
-      s_state = MSTATE_ACTIVATING;
-      s_act_frame = 0;
-      break;
-    case MSTATE_TRANSFORMED:
-      // Power down through the red-spark -> green -> white sequence.
-      s_state = MSTATE_DEACTIVATING;
-      s_deact_frame = 0;
-      break;
-    case MSTATE_DEACTIVATING:     break;  // already powering down
-    // Recalibration / Master Control / Hijacked exit to idle.
-    default:                      s_state = MSTATE_IDLE; break;
-  }
-  refresh();
-}
-
-// SELECT long: enter / exit DNA Scan mode.
-static void select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (locked_in_recal()) return;
-  s_state = (s_state == MSTATE_DNA_SCAN) ? MSTATE_IDLE : MSTATE_DNA_SCAN;
-  refresh();
-}
-
-// DOWN short: next alien while selecting; otherwise cycle the scan modes
-// idle -> yellow alien scan -> purple only -> idle.
-static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (locked_in_recal()) return;
-  if (s_state == MSTATE_TRANSFORM_SELECT) {
-    s_selected_alien = (s_selected_alien + 1) % NUM_ALIENS;
-    refresh();
-  } else if (s_state == MSTATE_IDLE) {
-    start_flash(GColorYellow, MSTATE_ALIEN_SCAN, false, FLASH_FRAMES);
-    refresh();
-  } else if (s_state == MSTATE_ALIEN_SCAN) {
-    start_flash(GColorPurple, MSTATE_PURPLE, false, FLASH_FRAMES);
-    refresh();
-  } else if (s_state == MSTATE_PURPLE) {
-    s_state = MSTATE_IDLE;
-    refresh();
-  }
-}
-
-// DOWN long: toggle Master Control badge state.
-static void down_long_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (locked_in_recal()) return;
-  s_state = (s_state == MSTATE_MASTER_CONTROL) ? MSTATE_IDLE : MSTATE_MASTER_CONTROL;
-  refresh();
-}
+static void up_click(ClickRecognizerRef r, void *c)     { router_click(BUTTON_ID_UP, false); }
+static void up_long(ClickRecognizerRef r, void *c)      { router_click(BUTTON_ID_UP, true); }
+static void select_click(ClickRecognizerRef r, void *c) { router_click(BUTTON_ID_SELECT, false); }
+static void select_long(ClickRecognizerRef r, void *c)  { router_click(BUTTON_ID_SELECT, true); }
+static void down_click(ClickRecognizerRef r, void *c)   { router_click(BUTTON_ID_DOWN, false); }
+static void down_long(ClickRecognizerRef r, void *c)    { router_click(BUTTON_ID_DOWN, true); }
+static void back_click(ClickRecognizerRef r, void *c)   { router_click(BUTTON_ID_BACK, false); }
 
 static void click_config_provider(void *context) {
-  window_single_click_subscribe(BUTTON_ID_UP, up_click_handler);
-  window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
-  window_single_click_subscribe(BUTTON_ID_DOWN, down_click_handler);
-  window_long_click_subscribe(BUTTON_ID_UP, 0, up_long_click_handler, NULL);
-  window_long_click_subscribe(BUTTON_ID_SELECT, 0, select_long_click_handler, NULL);
-  window_long_click_subscribe(BUTTON_ID_DOWN, 0, down_long_click_handler, NULL);
+  window_single_click_subscribe(BUTTON_ID_UP, up_click);
+  window_single_click_subscribe(BUTTON_ID_SELECT, select_click);
+  window_single_click_subscribe(BUTTON_ID_DOWN, down_click);
+  window_single_click_subscribe(BUTTON_ID_BACK, back_click);
+  window_long_click_subscribe(BUTTON_ID_UP, 0, up_long, NULL);
+  window_long_click_subscribe(BUTTON_ID_SELECT, 0, select_long, NULL);
+  window_long_click_subscribe(BUTTON_ID_DOWN, 0, down_long, NULL);
 }
 
 // ---------------------------------------------------------------------------
-// Window lifecycle
+// Window / app lifecycle
 // ---------------------------------------------------------------------------
 static void main_window_load(Window *window) {
-  Layer *window_layer = window_get_root_layer(window);
-  GRect bounds = layer_get_bounds(window_layer);
-
-  s_omnitrix_layer = layer_create(bounds);
+  Layer *wl = window_get_root_layer(window);
+  s_omnitrix_layer = layer_create(layer_get_bounds(wl));
   layer_set_update_proc(s_omnitrix_layer, omnitrix_update_proc);
-  layer_add_child(window_layer, s_omnitrix_layer);
-
-  // Status overlay (countdown / alien / cooldown).
-  s_time_layer = text_layer_create(GRect(0, bounds.size.h / 2 - 30, bounds.size.w, 44));
-  text_layer_set_background_color(s_time_layer, GColorClear);
-  text_layer_set_text_color(s_time_layer, GColorWhite);
-  text_layer_set_font(s_time_layer, fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD));
-  text_layer_set_text_alignment(s_time_layer, GTextAlignmentCenter);
-
-  s_date_layer = text_layer_create(GRect(0, bounds.size.h / 2 + 18, bounds.size.w, 28));
-  text_layer_set_background_color(s_date_layer, GColorClear);
-  text_layer_set_text_color(s_date_layer, GColorWhite);
-  text_layer_set_font(s_date_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-  text_layer_set_text_alignment(s_date_layer, GTextAlignmentCenter);
-
-  layer_set_hidden(text_layer_get_layer(s_time_layer), true);
-  layer_set_hidden(text_layer_get_layer(s_date_layer), true);
-
-  layer_add_child(window_layer, text_layer_get_layer(s_time_layer));
-  layer_add_child(window_layer, text_layer_get_layer(s_date_layer));
+  layer_add_child(wl, s_omnitrix_layer);
 }
 
 static void main_window_unload(Window *window) {
   layer_destroy(s_omnitrix_layer);
-  text_layer_destroy(s_time_layer);
-  text_layer_destroy(s_date_layer);
 }
 
-// ---------------------------------------------------------------------------
-// App lifecycle
-// ---------------------------------------------------------------------------
 static void init() {
   s_main_window = window_create();
   window_set_background_color(s_main_window, GColorBlack);
-
   window_set_window_handlers(s_main_window, (WindowHandlers) {
-    .load = main_window_load,
-    .unload = main_window_unload
-  });
+    .load = main_window_load, .unload = main_window_unload });
   window_set_click_config_provider(s_main_window, click_config_provider);
-
   window_stack_push(s_main_window, true);
-  update_status();
-
-  // One-second tick drives the countdown and auto-transitions.
-  tick_timer_service_subscribe(SECOND_UNIT, tick_handler);
   s_anim_timer = app_timer_register(ANIM_INTERVAL_MS, anim_timer_callback, NULL);
 }
 
 static void deinit() {
-  if (s_anim_timer) {
-    app_timer_cancel(s_anim_timer);
-  }
-  tick_timer_service_unsubscribe();
+  if (s_anim_timer) app_timer_cancel(s_anim_timer);
   window_destroy(s_main_window);
 }
 
